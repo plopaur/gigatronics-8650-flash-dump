@@ -19,8 +19,7 @@ It has **not** yet been run on real hardware.
 |------|----------|
 | `gt8650_dump.py` | The dump tool |
 | `GT8650_Firmware_Analysis.md` / `.pdf` | Firmware analysis report (revised 13 Oct 2026) |
-| `GT8650_HyperTerminal_Read100.md` / `.pdf` | Guide: reading the first 100 bytes by hand (revised) |
-| `original/` | The original PDFs from 9 Oct 2026, with the wrong address `0x6010` |
+| `GT8650_HyperTerminal_Read100.md` / `.pdf` | Guide: reading the first 100 bytes by hand (revised 13 Oct 2026) |
 | `tools/md2pdf.py` | Generates the PDFs from the `.md` files (ReportLab) |
 | `LICENSE` | MIT license |
 
@@ -40,7 +39,7 @@ python3 tools/md2pdf.py GT8650_HyperTerminal_Read100.md
 
 ## Requirements
 
-- Python 3.7 or later
+- Python 3.8 or later
 - pyserial:
   ```bash
   pip install pyserial
@@ -119,7 +118,7 @@ gt8650_dump.py -p PORT [-b BAUD] [--start ADDR] [--length N] [--base ADDR]
 | `--length`          | Number of bytes. If omitted, reads up to the end of the `--verify` file                  |
 | `--base`            | Bus address of byte 0 of the `.bic`, default `0x6000`. Only needed for other firmware versions |
 | `-o`, `--out`       | Output file, default `dump.bin`                                                          |
-| `--verify REF.bic`  | After reading, compares the part of the dump that overlaps the reference                 |
+| `--verify REF.bic`  | After reading, compares the part of the dump that overlaps the reference. With `--probe`: checks the mapping |
 | `--probe`           | Reads 16 bytes each at `0x0`, `0x4000` and `--base`, checks the mapping, then exits      |
 | `--wait`            | How long to keep sending `*` while waiting for power-on, default `60` s                  |
 | `--read-timeout`    | Timeout per `read()` in seconds, default `0.25`                                          |
@@ -162,10 +161,10 @@ Each `PEH` command returns 40 bytes as 80 hex characters plus CR/LF, and the com
 itself is about 10 characters. At 9600 baud that gives at most about 400 bytes/s.
 The script shows the remaining time (ETA) while dumping.
 
-| Range                 | Size        | Duration (min.) |
-|-----------------------|-------------|-----------------|
-| Firmware image        | 1,080,718 B | about 45 min    |
-| Full 2 MB flash       | 2,097,152 B | about 85 min    |
+| Range                 | Size        | Minimum duration |
+|-----------------------|-------------|------------------|
+| Firmware image        | 1,080,718 B | about 45 min     |
+| Full 2 MB flash       | 2,097,152 B | about 85 min     |
 
 ---
 
@@ -194,7 +193,7 @@ Derived from the chip-select table (file `0x301A`) and the initialisation code:
 | Range                       | Contents                                                  |
 |-----------------------------|-----------------------------------------------------------|
 | `0x000000–0x0FFFFF`         | Flash, CS0                                                |
-| ` ├ 0x000000–0x003FFF`      | Boot block and monitor copy (not in the `.bic`)           |
+| ` ├ 0x000000–0x003FFF`      | Boot block (not in the `.bic`, contents unknown)          |
 | ` ├ 0x004000–0x005FFF`      | Data block with checksum (not in the `.bic`)              |
 | ` └ 0x006000–…`             | Firmware image `8600_155.bic` (VBR = `0x6000`)            |
 | `0x100000–0x1FFFFF`         | Flash, CS1 (continued; the image ends at `0x10DD8D`)      |
@@ -226,7 +225,7 @@ initial stack pointer and reset PC.
 
 ## Corrections to the first edition
 
-The original PDFs in `original/` get the protocol right: `PEH`, 40-byte default,
+The first editions (9 Oct 2026, not included) get the protocol right: `PEH`, 40-byte default,
 hex reply with CR/LF, `*` and the banner. The following statements were wrong and
 have been corrected in the current documents:
 
@@ -248,20 +247,41 @@ have been corrected in the current documents:
 - The length of the `*` window is an estimate. That is why the script sends `*` continuously.
 - How the monitor responds to empty or unknown lines has not been analysed.
   The "monitor already active" check sends a CR and discards whatever comes back.
-- The boot block at `0x0` is not in the `.bic`. That it loads the same monitor copy
-  at start-up is inferred from the code, not proven.
+- The checksum in the boot header (`0x6418`) and the one in the data block (`0x4000`)
+  have not been analysed: neither the algorithm nor the covered range is known.
+- The boot block at `0x0` is not in the `.bic`. That it loads the same monitor layout
+  is inferred from the entry-address calculation (`0x71C4 − 0x6400 + 0x2FC000`), not proven.
 
 ## Reference firmware
 
 | Property    | Value |
 |-------------|-------|
-| File        | `8600_155.bic` (the original PDFs call it `84e2587e-8600_155.bic`) |
+| File        | `8600_155.bic` (the first editions call it `84e2587e-8600_155.bic`) |
 | Size        | 1,080,718 bytes (`0x107D8E`) |
 | CRC32       | `7414aad0` |
 | SHA-256     | `6fe062387758c7e7c2f4313963a99a860be889aed99918fdb81e397de44f26cf` |
+| Format      | Raw image of the flash range `0x6000–0x10DD8D`, no file header or trailer |
+| Internal checksum | Field at `0x6418` in the boot header; algorithm and covered range not analysed |
 | CPU         | Motorola MC68340 (CPU32), big-endian |
 | RTOS        | Nucleus PLUS – 68340D Version 1.11.4 |
 | Identification | `(C) Giga-tronics, 1999`, `Gigatronics 8650 Universal Power Meter` |
+
+CRC32 and SHA-256 are taken over the whole file. They only identify the file; the
+firmware does not check them.
+
+The `.bic` is a byte-for-byte copy of the flash contents from `0x6000` onwards:
+
+- File offset 0 is the exception vector table (initial SP `0x2D8FFC`, reset PC `0x9D2A`),
+  and the firmware sets VBR = `0x6000`.
+- The file size equals the image length stored in the boot header at `0x6414`, so
+  nothing is appended.
+- The boot header at file offset `0x400` (flash `0x6400`) belongs to the firmware itself
+  (jump table, length, checksum). It is not a container header of the file.
+
+The `.bic` only covers part of the flash. The boot block (`0x0000–0x3FFF`), the data
+block (`0x4000–0x5FFF`) and everything after `0x10DD8D` are missing. That the bytes sit
+in the instrument exactly like this is derived from the code. It still has to be
+confirmed on real hardware with `--probe`.
 
 ## Key locations in the firmware
 

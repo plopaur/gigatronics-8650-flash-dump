@@ -22,9 +22,12 @@ The monitor runs at power-on: after the self-test it listens for about 1-2 s for
 | CPU / arch | Motorola MC68340 (CPU32), big-endian | LINK A6 / UNLK A6 / RTS epilogues; MOVEC, MOVES; MBAR write 0xFFFFF101 |
 | RTOS | Nucleus PLUS 68340D v1.11.4 | "Copyright (c) 1993-1999 ATI - Nucleus PLUS - 68340D Version 1.11.4" |
 | Image size | 1,080,718 bytes (0x107D8E) | File length; equals the length field at file 0x414 |
-| Load mapping | runtime = file_offset + 0x6000 | VBR is set to 0x6000; cross-checked 4 ways (see sect. 5) |
+| File format | Raw flash image of 0x6000-0x10DD8D; no file header or trailer | File offset 0 is the vector table (SP 0x2D8FFC, PC 0x9D2A, VBR = 0x6000); file size = length field, so nothing is appended |
+| File hashes | CRC32 7414aad0; SHA-256 6fe06238...44f26cf (full value in README) | Taken over the whole file; identify the file only, not checked by the firmware |
+| Internal checksum | Field at file 0x418 (flash 0x6418) in the boot header | Algorithm and covered range not analysed |
+| Load mapping | runtime = file_offset + 0x6000 | VBR is set to 0x6000; cross-checked 5 ways (see sect. 5) |
 | Flash | CS0 0x000000-0x0FFFFF, CS1 0x100000-0x1FFFFF | Chip-select table at file 0x301A |
-| RAM | CS2 0x200000-0x2FFFFF (initial SP 0x2D8FFC, reset code sets 0x2FFFF0) | Chip-select table; RAM test 0x200000-0x300000 |
+| RAM | CS2 0x200000-0x2FFFFF (initial SP 0x2D8FFC, reset code sets 0x2FFFF0) | Chip-select table; RAM test 0x200000-0x2FFFFF |
 | Serial UART | MC68340 on-chip serial module, channel A at 0xFFFFF700 | Absolute-short `$F711.w` / `$F713.w` sign-extend to 0xFFFFF711 (SRA) / 0xFFFFF713 (RBA/TBA) |
 | Monitor line settings | 9600 baud, 8N1 | UART init at file 0x1774: CSR 0xBB, ACR 0x80, MR1 0x93, MR2 0x07 |
 
@@ -34,7 +37,7 @@ The monitor runs at power-on: after the self-test it listens for about 1-2 s for
 - Recognised the m68k/CPU32 code and mapped the SCPI command parse-tree (no raw-flash read command there).
 - Disassembled with Capstone (M68K, big-endian) to locate and decode the serial service monitor.
 - Resolved PC-relative string cross-references (base-independent) to label handlers.
-- Pinned the absolute load base from the VBR setup, the reset vector, the exception-vector stub table and absolute call targets.
+- Pinned the absolute load base from the VBR setup, the reset vector, the exception-vector stub table, the exception vectors and the self-relocation code.
 - Followed the boot path from the image header into the monitor, and decoded the chip-select and UART initialisation.
 - Decoded the command dispatch and the Peek/Poke handlers; characterised the on-wire framing end to end.
 - Wrote a dump tool and validated it against a simulated monitor (power-on window, active monitor, full read-back).
@@ -83,20 +86,19 @@ Consequence for dumping: the bytes of this image appear on the bus at **0x000060
 
 | Range | Contents |
 |---|---|
-| 0x000000-0x003FFF | Boot block and monitor copy (not part of the .bic) |
+| 0x000000-0x003FFF | Boot block (not part of the .bic; contents unknown) |
 | 0x004000-0x005FFF | Data block with length + checksum, checked at boot (probably calibration/configuration; not part of the .bic) |
 | 0x006000-0x0063FF | Exception vector table (VBR = 0x6000) |
-| 0x006400-0x00641F | Boot header: SP, jump to boot entry (0x6408), image length 0x107D8E (0x6414), checksum, application entry (0x641C), monitor entry (0x6420) |
-| 0x006420-0x10DD8D | Application code and data |
+| 0x006400-0x10DD8D | Boot header from 0x6400 (SP, jump to boot entry (0x6408), image length 0x107D8E (0x6414), checksum (0x6418), application entry (0x641C), monitor entry (0x6420)), followed by application code and data |
 | 0x200000-0x2FFFFF | RAM; the monitor runs from a copy at 0x2FC000 |
 | 0x800000- | Peripherals (CS3) |
 | 0xFFFFF000- | MC68340 on-chip modules (MBAR) |
 
-A dump from 0x000000 to 0x1FFFFF captures both flash chip-selects. That includes the boot block and the data block, which are not in the .bic.
+The boot header is part of the firmware, not a container header of the .bic file. A dump from 0x000000 to 0x1FFFFF captures both flash chip-selects. That includes the boot block and the data block, which are not in the .bic.
 
 ## 6. Entering the monitor
 
-The boot path (file offsets: subtract 0x6000 from the addresses shown):
+The boot path (addresses from 0x6000 upward lie in the image; subtract 0x6000 for the file offset):
 
 1. Boot entry 0x6408 jumps to 0x6854: SIM/chip-select initialisation, then a RAM pattern test over 0x200000-0x2FFFFF.
 2. If the RAM test passes, the data block at 0x4000 is checked (length word at 0x4000, at most 0x2000; checksum). The result is stored as a fault code: 0x10 = RAM fault, 0x04 = data-block fault.
@@ -130,13 +132,13 @@ python3 gt8650_dump.py -p /dev/ttyUSB0 --start 0 --length 0x200000 \
         -o flash_full.bin --verify 8600_155.bic
 ```
 
-At 9600 baud one 40-byte block costs about 92 characters on the wire, so throughput is at most about 400 B/s. The image takes at least 45 min and the full 2 MB flash at least 85 min.
+At 9600 baud one 40-byte block costs about 92 characters on the wire, so throughput is at most about 400 B/s. Even at that rate the image takes about 45 min and the full 2 MB flash about 85 min.
 
 ## 8. Changes from the first edition (9 Oct 2026)
 
 | First edition | Corrected |
 |---|---|
-| runtime = file_offset + 0x6010 | runtime = file_offset + 0x6000 (VBR, reset vector, stub table, call targets) |
+| runtime = file_offset + 0x6010 | runtime = file_offset + 0x6000 (VBR, reset vector, stub table, exception vectors, self-relocation code) |
 | Image size 0x107ECE; bus range 0x6010-0x10DEDE | Image size 0x107D8E; bus range 0x6000-0x10DD8D |
 | Jump table "at runtime 0x12B0"; handlers 0x1A88 etc. | These are file offsets; RAM copy at +0x2FBC00, flash at +0x6000 |
 | DUART at 0x00F700 | MC68340 on-chip serial module at 0xFFFFF700 |
@@ -148,5 +150,6 @@ At 9600 baud one 40-byte block costs about 92 characters on the wire, so through
 
 - **Findings are static.** The PEH read path, the absence of an auth gate, the load base and the UART settings are unambiguous in the code. The dumper has been validated only against a simulated monitor and should be confirmed on a live unit with `--probe`.
 - **Power-on window.** The 1-2 s figure is an estimate from the poll loop; the dumper therefore sends `*` continuously.
+- **Checksums.** The checksum in the boot header (0x6418) and the one in the data block (0x4000) have not been analysed: neither the algorithm nor the covered range is known.
 - **Boot block.** The code at 0x0 is not in this image. That it loads the same monitor layout is inferred from the entry-address calculation (0x71C4 - 0x6400 + 0x2FC000), not proven.
 - **Baud clock.** 9600 baud assumes the standard 3.6864 MHz serial clock; if no banner appears, try 19200 and 115200.
