@@ -28,8 +28,12 @@ USAGE
   # dump that starts somewhere else, e.g. at 0x6000
   python3 extract_bic.py firmware.bin --start 0x6000
 
-  # check an existing .bic (detected because file size == length field)
+  # check an existing .bic (detected because file size == length field,
+  # or the length field plus less than 4 KiB of zero padding, as in 8650_135)
   python3 extract_bic.py 8600_155.bic
+
+  # strip the padding from a padded .bic
+  python3 extract_bic.py 8650_135.bic -o 8650_135_trimmed.bic
 """
 import os, sys, struct, argparse
 
@@ -42,6 +46,7 @@ BOOT_BASE   = 0x000000
 BOOT_SIZE   = 0x4000
 DATA_BASE   = 0x004000
 DATA_MAX    = 0x2000
+PAD_MAX     = 0x1000      # zero padding tolerated after the image in a .bic
 ID_OFF      = 0x0C        # boot-block field patched with the unit ID
 
 u32 = lambda b, o: struct.unpack_from('>I', b, o)[0]
@@ -86,6 +91,17 @@ def check_image(img):
     ok = calc == stored
     return ok, length, (f"length {length:#x}, checksum {stored:#010x} "
                         f"{'OK' if ok else f'MISMATCH (computed {calc:#010x})'}")
+
+def bic_length(data):
+    """Image length if data looks like a .bic, else None.  A .bic is exactly
+    `len` bytes or, as seen in 8650_135.bic, padded with fewer than PAD_MAX
+    zero bytes (that file is rounded up to a 4 KiB multiple)."""
+    if len(data) < CK_OFF + 4:
+        return None
+    length = u32(data, LEN_OFF)
+    if not 0x420 <= length <= len(data) < length + PAD_MAX:
+        return None
+    return length if not any(data[length:]) else None
 
 def check_boot(boot, img=None):
     """boot = flash 0x0000-0x3FFF.  Returns (ok, msg)."""
@@ -144,12 +160,16 @@ def main():
     args = ap.parse_args()
     data = open(args.dump, 'rb').read()
 
-    start = args.start
+    start, is_bic = args.start, False
     if start is None:
-        is_bic = len(data) >= CK_OFF + 4 and u32(data, LEN_OFF) == len(data)
+        length = bic_length(data)
+        is_bic = length is not None
         start = IMAGE_BASE if is_bic else 0
-        if is_bic:
+        if is_bic and length == len(data):
             print(f"[*] {args.dump}: file size equals the length field -> .bic")
+        elif is_bic:
+            print(f"[*] {args.dump}: length field {length:#x} + "
+                  f"{len(data) - length} zero bytes padding -> .bic")
 
     results = check_flash(data, start)
     if not any(n.startswith('firmware') for n, _, _ in results):
@@ -159,7 +179,7 @@ def main():
         print(f"[{'+' if ok else '!'}] {name}: {msg}")
     img_ok = results[-1][1]
 
-    if start == IMAGE_BASE and len(data) == u32(data, LEN_OFF) and not args.out:
+    if is_bic and not args.out:
         return 0 if img_ok else 1
     ok, length, _ = check_image(data[IMAGE_BASE - start:])
     if length > len(data) - (IMAGE_BASE - start) or not 0x420 <= length <= IMAGE_MAX:

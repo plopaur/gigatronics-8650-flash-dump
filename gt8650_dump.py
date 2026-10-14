@@ -61,8 +61,8 @@ Needs: pip install pyserial, and extract_bic.py next to this script.
 """
 import os, sys, time, argparse, binascii
 
-from extract_bic import (check_flash, check_data, u32, HDR, LEN_OFF, CK_OFF,
-                         DATA_BASE)
+from extract_bic import (check_flash, check_data, bic_length, u32, HDR,
+                         LEN_OFF, CK_OFF, DATA_BASE)
 
 try:
     import serial  # pyserial
@@ -278,8 +278,10 @@ def dump(ser, start, length, out_path, args):
 
 def verify(data, start, ref_path, base):
     """Compare the part of the dump that overlaps the reference image.
-    The reference occupies [base, base + len(ref)) on the bus."""
+    The reference occupies [base, base + len(ref)) on the bus; zero padding
+    after the image in a padded .bic is not compared."""
     ref = open(ref_path, 'rb').read()
+    ref = ref[:bic_length(ref) or len(ref)]
     lo = max(start, base)
     hi = min(start + len(data), base + len(ref))
     if lo >= hi:

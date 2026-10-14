@@ -4,7 +4,7 @@
 Giga-tronics 8650 Universal Power Meter (8600A series)
 Image: `8600_155.bic` - static reverse-engineering report - 9 Oct 2026, revised 13 and 14 Oct 2026
 
-> **Revision 14 Oct 2026.** Two full 2 MB flash dumps read from live units (firmware 1.58 and 1.61) were compared with the .bic. They confirm that a .bic is a raw slice of flash with no container header. All three checksums (firmware image, boot block, data block) are now decoded, and the boot block at 0x0 turns out to be a copy of the image's boot code. New section 6; all changes are listed in section 9.
+> **Revision 14 Oct 2026.** Two full 2 MB flash dumps read from live units (firmware 1.58 and 1.61) were compared with the .bic. They confirm that a .bic is a raw slice of flash with no container header. All three checksums (firmware image, boot block, data block) are now decoded, and the boot block at 0x0 turns out to be a copy of the image's boot code. New section 6; all changes are listed in section 9. A fourth image, `8650_135.bic` (an older 8650 build, zero-padded), was compared as well; its image checksum matches (section 6.5).
 
 > **Revision 13 Oct 2026.** The load base is **0x6000**, not 0x6010 as stated in the first edition. The handler addresses there are file offsets, not runtime addresses. This edition also corrects the image size and the serial port address, derives the baud rate, and describes how the monitor is entered. All changes are listed in section 8.
 
@@ -26,7 +26,7 @@ The monitor runs at power-on: after the self-test it listens for about 1-2 s for
 | Image size | 1,080,718 bytes (0x107D8E) | File length; equals the length field at file 0x414 |
 | File format | Raw flash image of 0x6000-0x10DD8D; no file header or trailer | File offset 0 is the vector table (SP 0x2D8FFC, PC 0x9D2A, VBR = 0x6000); file size = length field, so nothing is appended |
 | File hashes | CRC32 7414aad0; SHA-256 6fe06238...44f26cf (full value in README) | Taken over the whole file; identify the file only, not checked by the firmware |
-| Internal checksum | Field at file 0x418 (flash 0x6418) in the boot header: 32-bit sum of the big-endian 16-bit words over file 0 ... len-1, with the checksum field counted as 0 | Matches 1.55 (.bic), 1.58 and 1.61 (dumps); see section 6.2 |
+| Internal checksum | Field at file 0x418 (flash 0x6418) in the boot header: 32-bit sum of the big-endian 16-bit words over file 0 ... len-1, with the checksum field counted as 0 | Matches 1.35 and 1.55 (.bic), 1.58 and 1.61 (dumps); see sections 6.2 and 6.5 |
 | Load mapping | runtime = file_offset + 0x6000 | VBR is set to 0x6000; cross-checked 5 ways (see sect. 5) |
 | Flash | CS0 0x000000-0x0FFFFF, CS1 0x100000-0x1FFFFF | Chip-select table at file 0x301A |
 | RAM | CS2 0x200000-0x2FFFFF (initial SP 0x2D8FFC, reset code sets 0x2FFFF0) | Chip-select table; RAM test 0x200000-0x2FFFFF |
@@ -161,6 +161,18 @@ Verified for both dumps (0xF6F981AC and 0x840E6C02). Content in both units, L = 
 
 At boot the block is also copied to RAM 0x200000 (0x6D22).
 
+### 6.5 Firmware 1.35 (`8650_135.bic`)
+
+A further image, `8650_135.bic`, was found as a file (not read from a unit). The version 1.35 is taken from the file name.
+
+- **Checksum:** length field @0x414 = 0x10EF88, checksum @0x418 = 0xECAA2EF6. `sum16(image[0 : 0x10EF88])` with the field counted as 0 gives the same value, so the image is intact and uses the same algorithm as 1.55-1.61.
+- **Padding:** the file is 0x10F000 bytes, i.e. the image plus 120 zero bytes up to a 4 KiB multiple (bus 0x115000). The checksum does not cover the padding. `extract_bic.py` accepts such a file as a .bic (less than 4 KiB of zero padding after the length) and removes the padding with `-o`. Trimmed: 1,109,896 B, SHA-256 635d38f8...dd364359.
+- **Older build:** Nucleus PLUS "68340D Version 1.1.G1.2" (1993-1996) instead of 1.11.4; the 1.55 string "Engineering Version 0000.00" is missing.
+- **Header:** same layout. The word at 0x410 is 0x00010006 (0x00010007 in 1.55-1.61). The `JMP` targets at 0x42C and 0x432 differ (0x19550, 0x18CF8).
+- **Vector table:** identical to 1.55 except the reset PC at 0x004 (0x9E2E instead of 0x9D2A).
+- **Boot code** 0x430-0x2EAF differs from 1.55. Because the boot block at flash 0x0 is a copy of this range (section 6.3), installing 1.35 on a unit would also need a matching boot block. The CRC tables at 0x2A48-0x2D47 are identical.
+- **Similarity:** only 47 % (1.55, 1.58) and 44 % (1.61) of its 16-byte blocks occur verbatim in the 8600 images.
+
 ## 7. Entering the monitor
 
 The boot path (addresses from 0x6000 upward lie in the image; subtract 0x6000 for the file offset). After a reset the CPU runs the identical copy in the boot block (section 6.3), where every address below is 0x6400 lower:
@@ -185,7 +197,7 @@ A self-contained Python 3 tool (pyserial) that drives the monitor and reassemble
 - `--verify` compares the part of the dump that overlaps a reference .bic placed at the base address. This only makes sense for the same firmware version.
 - `--probe` reads 0x0, 0x4000 and 0x6000, shows the image length and checksum from the boot header, checks the data-block CRC, and confirms the mapping against the reference if one is given.
 
-`extract_bic.py` (no dependencies; imported by the dumper for the checksum code) checks a dump offline and writes the firmware image as a .bic. Given a .bic it only checks the image checksum.
+`extract_bic.py` (no dependencies; imported by the dumper for the checksum code) checks a dump offline and writes the firmware image as a .bic. Given a .bic it only checks the image checksum; a .bic with less than 4 KiB of zero padding after the image (such as `8650_135.bic`) is also recognised, and `-o` writes it without the padding.
 
 ### Typical use:
 
@@ -214,6 +226,7 @@ At 9600 baud one 40-byte block costs about 92 characters on the wire, so through
 | Data block checksum: algorithm unknown | Two CRC-16/XMODEM (bytes and bit-reversed bytes), stored after the block |
 | Boot block contents unknown | Copy of image 0x400-0x2EAF plus unit ID and sum16 trailer; reset and monitor run from it |
 | Dumper needs a .bic for length and verification | Length from the device header; checksum self-check without a reference |
+| .bic size always equals the length field | `8650_135.bic` (1.35) carries 120 zero bytes of padding; `extract_bic.py` and `--verify` handle it |
 
 ### Revision 13 Oct 2026 (changes from the first edition, 9 Oct 2026)
 

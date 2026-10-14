@@ -8,6 +8,7 @@ It is based on a static analysis of the firmware image `8600_155.bic`
 (Motorola 68340 / CPU32, Nucleus PLUS 1.11.4). The protocol was checked against the
 firmware, and the script has since been used on live units: two complete 2 MB
 flash dumps (firmware 1.58 and 1.61) were read with it, and all their checksums match.
+A fourth image, `8650_135.bic` (an older 8650 build), also passes the image checksum.
 
 > **Note:** The first editions of the documents and of the script (9 Oct 2026)
 > assumed a load address of `0x6010`. The correct value is **`0x6000`**. Everything has
@@ -191,7 +192,15 @@ python3 extract_bic.py flash_full.bin -o 8600_158.bic
 ```
 
 For a dump that does not start at `0` pass `--start` (e.g. `--start 0x6000`).
-Given a `.bic`, the script only checks its checksum.
+Given a `.bic`, the script only checks its checksum. A `.bic` is recognised when its
+size equals the length field at `0x414`, or when it has less than 4 KiB of zero
+padding after the image (as `8650_135.bic` does). With `-o` the padding is removed:
+
+```bash
+python3 extract_bic.py 8650_135.bic -o 8650_135_trimmed.bic
+```
+
+`gt8650_dump.py --verify` also ignores this padding.
 
 ### Duration
 
@@ -244,7 +253,8 @@ Conversion: **device address = offset in the `.bic` + `0x6000`**.
 
 ## Flash layout and checksums
 
-Found in the 1.58 and 1.61 full dumps and verified for all three versions.
+Found in the 1.58 and 1.61 full dumps. The image checksum is verified for all four
+versions, including the 1.35 `.bic`.
 `sum16` is the 32-bit sum (mod 2³²) of the big-endian 16-bit words.
 
 | Region | Format | Checksum |
@@ -253,11 +263,11 @@ Found in the 1.58 and 1.61 full dumps and verified for all three versions.
 | Boot block `0x0000` | Copy of image `0x400–0x2EAF` (0x2AB0 bytes so far), field `0x0C` = unit ID, then trailer: u32 `0x2AB4`, u32 checksum | `sum16(block[0 : 0x2AB4])` |
 | Data block `0x4000` | u32 length L (≤ `0x2000`, includes the length word), data, u32 CRC at `0x4000 + L` | CRC-16/XMODEM of the bytes in the high word, CRC-16/XMODEM of the bit-reversed bytes in the low word (routine at bus `0x875C`) |
 
-| | 1.55 (`.bic`) | 1.58 dump | 1.61 dump |
-|---|---|---|---|
-| Image length | `0x107D8E` | `0x108012` | `0x107DCE` |
-| Image checksum | `0xF30EEABF` | `0xF2095A84` | `0xF2C7306F` |
-| Unit ID (boot `0x0C`, data `0x4010`) | – | `0x0083FD8B` = 8650123 | `0x0083FD9D` = 8650141 |
+| | 1.35 (`.bic`) | 1.55 (`.bic`) | 1.58 dump | 1.61 dump |
+|---|---|---|---|---|
+| Image length | `0x10EF88` | `0x107D8E` | `0x108012` | `0x107DCE` |
+| Image checksum | `0xECAA2EF6` | `0xF30EEABF` | `0xF2095A84` | `0xF2C7306F` |
+| Unit ID (boot `0x0C`, data `0x4010`) | – | – | `0x0083FD8B` = 8650123 | `0x0083FD9D` = 8650141 |
 
 The two dumps carry different unit IDs, so they most likely come from two
 different instruments. Details are in the analysis report, section 6.
@@ -338,13 +348,24 @@ unit ID and NV data and are therefore unique to each instrument.
 | `8600_155.bic` | 1,080,718 B (`0x107D8E`) | `0xF30EEABF` | `7414aad0` | `6fe062387758c7e7c2f4313963a99a860be889aed99918fdb81e397de44f26cf` |
 | `8600_158.bic` | 1,081,362 B (`0x108012`) | `0xF2095A84` | `0e8391e8` | `710b25387d8f3d6c9fb0f31984bfc7dd33d10fcf837889e063e5887f1e63c311` |
 | `8600_161.bic` | 1,080,782 B (`0x107DCE`) | `0xF2C7306F` | `bd154108` | `a3ff8a682fee2b0b458a4ebf3c07edb1662087f649c959382265138a6cc06f09` |
+| `8650_135.bic` (as found, padded) | 1,110,016 B (`0x10F000`) | `0xECAA2EF6` | `95af342f` | `68450fdf98da42274a459c078d8568d05118bbe41ed66ca0a69459d10972d5b2` |
+| `8650_135.bic` trimmed to the length field | 1,109,896 B (`0x10EF88`) | `0xECAA2EF6` | `5d540171` | `635d38f8e8f13b4534f36198e791c1edd93672caf2d297f98bf965c0dd364359` |
+
+`8650_135.bic` was not extracted from a dump but found as a file. It is an older
+build: Nucleus PLUS 68340D Version 1.1.G1.2 (1993–1996) instead of 1.11.4, boot header
+word `0x410` = `0x00010006` instead of `0x00010007`, reset PC `0x9E2E` instead of
+`0x9D2A`, and different boot code. Only 44–47 % of its 16-byte blocks occur in the
+8600 images. The file is padded with 120 zero bytes up to a 4 KiB multiple
+(bus `0x115000`); the image checksum covers only the first `0x10EF88` bytes.
+Details are in the analysis report, section 6.5.
 
 The `.bic` is a byte-for-byte copy of the flash contents from `0x6000` onwards:
 
 - File offset 0 is the exception vector table (initial SP `0x2D8FFC`, reset PC `0x9D2A`),
   and the firmware sets VBR = `0x6000`.
 - The file size equals the image length stored in the boot header at `0x6414`, so
-  nothing is appended.
+  nothing is appended (`8650_135.bic` is the exception: it carries 120 zero bytes of
+  padding, which are not part of the image).
 - The boot header at file offset `0x400` (flash `0x6400`) belongs to the firmware itself
   (jump table, length, checksum). It is not a container header of the file.
 
