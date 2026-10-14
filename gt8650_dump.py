@@ -24,9 +24,16 @@ PROTOCOL (verified in the firmware):
         runtime_address = file_offset + 0x6000   (firmware sets VBR = 0x6000)
         Flash CS0 0x000000-0x0FFFFF, CS1 0x100000-0x1FFFFF, RAM 0x200000-0x2FFFFF.
         0x0000-0x3FFF boot block, 0x4000-0x5FFF data block (not in the .bic).
+  * Boot header at runtime 0x6400: image length @0x6414, checksum @0x6418
+    (see extract_bic.py for the checksum algorithms).
 
 USAGE EXAMPLES
-  # Start the script, THEN switch the instrument on (it keeps sending '*'):
+  # Start the script, THEN switch the instrument on (it keeps sending '*').
+  # Without --length the image length is read from the device's boot header,
+  # so this dumps exactly the installed firmware, whatever its version:
+  python3 gt8650_dump.py -p /dev/ttyUSB0 -o firmware.bin
+
+  # Same, and also compare against a reference .bic of the same version:
   python3 gt8650_dump.py -p /dev/ttyUSB0 -o firmware.bin --verify 8600_155.bic
 
   # Quick probe: confirm link + mapping before a long dump
@@ -34,13 +41,28 @@ USAGE EXAMPLES
 
   # Whole 2 MB flash including boot block and data block:
   python3 gt8650_dump.py -p /dev/ttyUSB0 --start 0 --length 0x200000 \
-        -o flash_full.bin --verify 8600_155.bic
+        -o flash_full.bin
+
+SELF-CHECK
+  After every dump the checksums of all regions the dump fully covers are
+  checked (boot block, data block, firmware image), so no reference .bic is
+  needed.  extract_bic.py cuts the firmware image out of a full dump.
+
+RESUME / RECOVERY
+  Every block is flushed to disk.  If the monitor stops answering, the script
+  escalates automatically: soft resync -> reopen the serial port -> re-handshake
+  with a power-cycle prompt, then continues at the same address.  If it gives up
+  (or you press Ctrl-C), just run the SAME command again: an existing output file
+  is resumed (its tail is checked against the device first).  --restart overwrites.
 
 If the monitor is already active (e.g. after an earlier run without power
 cycling), the script detects that and skips the '*' handshake.
-Needs: pip install pyserial
+Needs: pip install pyserial, and extract_bic.py next to this script.
 """
-import sys, time, argparse, binascii
+import os, sys, time, argparse, binascii
+
+from extract_bic import (check_flash, check_data, u32, HDR, LEN_OFF, CK_OFF,
+                         DATA_BASE)
 
 try:
     import serial  # pyserial
@@ -136,29 +158,123 @@ def peek(ser, addr, retries=4):
         time.sleep(0.03 * (attempt + 1))
     raise IOError(f"bad/short reply at {addr:#08x}: {line!r}")
 
-def dump(ser, start, length, out_path):
-    got = bytearray()
+def soft_resync(ser, addr):
+    """Flush the monitor's line buffer (ESC discards the line, CR ends it)
+    and check that it answers PEH again.  Returns the block or raises IOError."""
+    ser.reset_output_buffer()
+    ser.write(b'\x1b\r\r')
+    ser.flush()
+    time.sleep(0.5)
+    ser.reset_input_buffer()
+    return peek(ser, addr, retries=2)
+
+def reopen_port(ser, timeout=30.0):
+    """Close and reopen the serial port (cures USB-serial adapter hiccups).
+    Waits up to `timeout` s if the adapter has temporarily disappeared."""
+    try:
+        ser.close()
+    except Exception:
+        pass
+    time.sleep(1.0)
+    deadline = time.time() + timeout
+    while True:
+        try:
+            ser.open()
+            return
+        except (OSError, serial.SerialException):
+            if time.time() > deadline:
+                raise
+            time.sleep(1.0)
+
+def recover(ser, addr, args, err):
+    """The monitor stopped answering at `addr`.  Escalate until it talks again:
+         1. soft resync (ESC/CR, flush buffers)
+         2. close + reopen the serial port
+         3. re-handshake: send '*' and ask the user to power-cycle the unit
+    Returns the 40-byte block at `addr`; raises RuntimeError when giving up."""
+    print(f"\n[!] {err}", file=sys.stderr)
+    for n in range(1, args.max_recoveries + 1):
+        try:
+            if n == 1:
+                print(f"[*] recovery {n}: soft resync ...", file=sys.stderr)
+            elif n == 2:
+                print(f"[*] recovery {n}: reopening serial port ...",
+                      file=sys.stderr)
+                reopen_port(ser)
+            else:
+                print(f"[*] recovery {n}: monitor not responding -- POWER-CYCLE "
+                      f"the instrument now (waiting up to {args.wait:.0f} s)\a",
+                      file=sys.stderr)
+                if not ser.is_open:
+                    reopen_port(ser)
+                if not handshake(ser, args.wait, args.base):
+                    continue
+            block = soft_resync(ser, addr)
+            print(f"[+] link restored, continuing at {addr:#08x}", file=sys.stderr)
+            return block
+        except (IOError, OSError) as e:      # SerialException is an IOError
+            print(f"[!] recovery {n} failed: {e}", file=sys.stderr)
+    raise RuntimeError(f"giving up at {addr:#08x} after "
+                       f"{args.max_recoveries} recovery attempts")
+
+def prepare_resume(ser, start, length, out_path, restart):
+    """Decide where to (re)start.  Returns number of bytes already on disk."""
+    if restart or not os.path.exists(out_path):
+        return 0
+    have = os.path.getsize(out_path)
+    if have == 0:
+        return 0
+    if have > length:
+        sys.exit(f"{out_path} is already {have} bytes, larger than the requested "
+                 f"{length}.  Use --restart to overwrite it.")
+    # sanity check: re-read the tail of the existing file from the device
+    tail_len = min(DEFAULT_BYTES, have)
+    tail_addr = start + have - tail_len
+    with open(out_path, 'rb') as f:
+        f.seek(have - tail_len)
+        old = f.read(tail_len)
+    new = peek(ser, tail_addr)[:tail_len]
+    if new != old:
+        sys.exit(f"[!] {out_path} does not match the device at {tail_addr:#08x} "
+                 "(different instrument/start address?).  Use --restart to "
+                 "overwrite it.")
+    print(f"[*] RESUMING: {have} bytes already in {out_path} "
+          f"(tail verified against device)", file=sys.stderr)
+    return have
+
+def dump(ser, start, length, out_path, args):
     end = start + length
-    addr = start
-    t0 = time.time()
-    with open(out_path, 'wb') as f:
+    have = prepare_resume(ser, start, length, out_path, args.restart)
+    addr = start + have
+    t0, done0, blocks, recoveries = time.time(), have, 0, 0
+    with open(out_path, 'r+b' if have else 'wb') as f:
+        f.seek(have)
+        f.truncate()
         while addr < end:
-            block = peek(ser, addr)            # 40 bytes
+            try:
+                block = peek(ser, addr, retries=args.retries)   # 40 bytes
+            except IOError as e:
+                recoveries += 1
+                block = recover(ser, addr, args, e)
             take = min(DEFAULT_BYTES, end - addr)
             f.write(block[:take])
-            got += block[:take]
+            f.flush()                       # every block is safe on disk
             addr += take
+            blocks += 1
             done = addr - start
-            if done % (DEFAULT_BYTES * 25) == 0 or addr >= end:
+            if blocks % 25 == 0 or addr >= end:
                 elapsed = max(1e-3, time.time() - t0)
-                rate = done / elapsed
+                rate = (done - done0) / elapsed
                 pct = 100.0 * done / length
                 eta = (length - done) / max(rate, 1e-3)
                 print(f"\r[+] {done}/{length} bytes ({pct:5.1f}%)  "
                       f"{rate:6.0f} B/s  ETA {eta/60:5.1f} min  @ {addr:#08x}",
                       end='', file=sys.stderr)
     print(file=sys.stderr)
-    return bytes(got)
+    if recoveries:
+        print(f"[*] {recoveries} link recoveries during this run", file=sys.stderr)
+    with open(out_path, 'rb') as f:
+        return f.read()
 
 def verify(data, start, ref_path, base):
     """Compare the part of the dump that overlaps the reference image.
@@ -180,13 +296,40 @@ def verify(data, start, ref_path, base):
         print(f"[!] VERIFY MISMATCH: first diff at bus address {lo+i:#08x} "
               f"(ref offset {lo-base+i:#x})", file=sys.stderr)
 
+def self_check(data, start, base):
+    """Check the checksums of every flash region the dump fully covers."""
+    results = check_flash(data, start, base)
+    if not results:
+        print("[*] self-check: dump covers no complete boot block, data block "
+              "or firmware image", file=sys.stderr)
+    for name, ok, msg in results:
+        print(f"[{'+' if ok else '!'}] self-check {name}: {msg}", file=sys.stderr)
+    return all(ok for _, ok, _ in results)
+
+def image_length(ser, base):
+    """Image length from the boot header on the device (bus base + 0x414)."""
+    hdr = peek(ser, base + HDR)
+    return u32(hdr, LEN_OFF - HDR), u32(hdr, CK_OFF - HDR)
+
 def do_probe(ser, ref, base):
-    for a in (0x00000000, 0x00004000, base):
+    for a in (0x00000000, DATA_BASE, base):
         try:
             b = peek(ser, a)[:16]
             print(f"  {a:#08x}: {b.hex(' ')}", file=sys.stderr)
         except IOError as e:
             print(f"  {a:#08x}: {e}", file=sys.stderr)
+    try:
+        length, ck = image_length(ser, base)
+        print(f"[*] boot header @{base + HDR:#x}: image length {length:#x} "
+              f"(bus {base:#x}..{base + length - 1:#x}), checksum {ck:#010x}",
+              file=sys.stderr)
+        blk = peek(ser, DATA_BASE)
+        if u32(blk, 0) + 4 <= len(blk):
+            ok, msg = check_data(blk)
+            print(f"[{'+' if ok else '!'}] data block @{DATA_BASE:#x}: {msg}",
+                  file=sys.stderr)
+    except IOError as e:
+        print(f"[!] header read failed: {e}", file=sys.stderr)
     if ref:
         data = open(ref, 'rb').read()
         live = peek(ser, base)
@@ -204,7 +347,9 @@ def main():
     ap.add_argument('-b', '--baud', type=int, default=9600)
     ap.add_argument('--start', type=auto, default=None,
                     help="start address (default: --base)")
-    ap.add_argument('--length', type=auto, default=0)
+    ap.add_argument('--length', type=auto, default=0,
+                    help="bytes to read (default: up to the end of the "
+                         "firmware image, from --verify or the device header)")
     ap.add_argument('--base', type=auto, default=BASE_OFFSET,
                     help="bus address of .bic byte 0 (default 0x6000)")
     ap.add_argument('-o', '--out', default='dump.bin')
@@ -216,6 +361,13 @@ def main():
                     help="seconds to keep sending '*' while waiting for "
                          "power-on (default 60)")
     ap.add_argument('--read-timeout', type=float, default=0.25)
+    ap.add_argument('--restart', action='store_true',
+                    help="overwrite an existing output file instead of resuming it")
+    ap.add_argument('--retries', type=int, default=4,
+                    help="PEH retries per block before recovery starts (default 4)")
+    ap.add_argument('--max-recoveries', type=int, default=6,
+                    help="recovery attempts per failure before giving up "
+                         "(default 6; #3 and later ask for a power-cycle)")
     args = ap.parse_args()
     start = args.base if args.start is None else args.start
 
@@ -236,12 +388,30 @@ def main():
                 print(f"[*] --length from {args.verify}: {length} bytes",
                       file=sys.stderr)
             else:
-                sys.exit("Specify --length (or --verify to take it from a .bic).")
+                img_len, _ = image_length(ser, args.base)
+                length = args.base + img_len - start
+                if not 0x420 <= img_len <= 0x1FA000 or length <= 0:
+                    sys.exit(f"implausible image length {img_len:#x} in the "
+                             "device's boot header (or --start beyond it); "
+                             "specify --length.")
+                print(f"[*] --length from the device's boot header: image "
+                      f"{img_len:#x} bytes -> {length} bytes to read",
+                      file=sys.stderr)
         print(f"[*] dumping {length} bytes from {start:#08x} -> {args.out}",
               file=sys.stderr)
-        data = dump(ser, start, length, args.out)
+        try:
+            data = dump(ser, start, length, args.out, args)
+        except (KeyboardInterrupt, RuntimeError) as e:
+            have = os.path.getsize(args.out) if os.path.exists(args.out) else 0
+            print(f"\n[!] stopped ({e or 'Ctrl-C'}) -- {have} bytes saved in "
+                  f"{args.out}.\n    Re-run the same command to resume at "
+                  f"{start + have:#08x}.", file=sys.stderr)
+            sys.exit(1)
+        ok = self_check(data, start, args.base)
         if args.verify:
             verify(data, start, args.verify, args.base)
+        if not ok:
+            sys.exit(3)
     finally:
         ser.close()
 

@@ -9,7 +9,7 @@ lists, pipe tables, fenced code blocks, '> ' callouts, inline `code`,
     <!-- footer: some text -->
 sets the page footer.
 
-Usage:  python3 tools/md2pdf.py DOC.md [OUT.pdf]      (needs: pip install reportlab)
+Usage:  python3 md2pdf.py DOC.md [OUT.pdf]      (needs: pip install reportlab)
 """
 import html, re, sys
 

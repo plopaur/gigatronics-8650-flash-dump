@@ -4,6 +4,9 @@
 # Dump output
 *.bin
 
+# Generated documents (md2pdf.py)
+*.pdf
+
 # Python
 __pycache__/
 *.pyc

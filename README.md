@@ -6,8 +6,8 @@ over its serial port. The tool uses the firmware's built-in service monitor and 
 
 It is based on a static analysis of the firmware image `8600_155.bic`
 (Motorola 68340 / CPU32, Nucleus PLUS 1.11.4). The protocol was checked against the
-firmware, and the script was tested offline against a simulated device.
-It has **not** yet been run on real hardware.
+firmware, and the script has since been used on live units: two complete 2 MB
+flash dumps (firmware 1.58 and 1.61) were read with it, and all their checksums match.
 
 > **Note:** The first editions of the documents and of the script (9 Oct 2026)
 > assumed a load address of `0x6010`. The correct value is **`0x6000`**. Everything has
@@ -18,21 +18,23 @@ It has **not** yet been run on real hardware.
 | File | Contents |
 |------|----------|
 | `gt8650_dump.py` | The dump tool |
-| `GT8650_Firmware_Analysis.md` / `.pdf` | Firmware analysis report (revised 13 Oct 2026) |
-| `GT8650_HyperTerminal_Read100.md` / `.pdf` | Guide: reading the first 100 bytes by hand (revised 13 Oct 2026) |
-| `tools/md2pdf.py` | Generates the PDFs from the `.md` files (ReportLab) |
+| `extract_bic.py` | Checks a dump offline and cuts out the firmware image as `.bic` (also provides the checksum code for the dump tool) |
+| `GT8650_Firmware_Analysis.md` | Firmware analysis report (revised 14 Oct 2026) |
+| `GT8650_HyperTerminal_Read100.md` | Guide: reading the first 100 bytes by hand (revised 13 Oct 2026) |
+| `md2pdf.py` | Generates PDFs from the `.md` files (ReportLab) |
 | `LICENSE` | MIT license |
 
 The reference firmware `8600_155.bic` is **not** included: it is Giga-tronics'
 copyrighted code. If you have a copy, put it next to the script and check it against
 the SHA-256 under [Reference firmware](#reference-firmware).
 
-The `.md` files are the source. After a change, regenerate the PDFs like this:
+The `.md` files are the source. PDFs are not part of the repository (`*.pdf` is in
+`.gitignore`); generate them locally if needed:
 
 ```bash
 pip install reportlab
-python3 tools/md2pdf.py GT8650_Firmware_Analysis.md
-python3 tools/md2pdf.py GT8650_HyperTerminal_Read100.md
+python3 md2pdf.py GT8650_Firmware_Analysis.md
+python3 md2pdf.py GT8650_HyperTerminal_Read100.md
 ```
 
 ---
@@ -68,9 +70,10 @@ If no banner comes back, also try `-b 19200` and `-b 115200`.
 
 At power-on the following sequence runs (reconstructed from the firmware):
 
-1. Boot entry `0x6408` → `0x6854`: hardware initialisation, then a RAM test over `0x200000–0x2FFFFF`
-2. Checksum over the data block at `0x4000` (probably calibration or configuration data)
-3. The monitor is copied to RAM at `0x2FC000` and started
+1. Boot entry `0x6408` → `0x6854`: hardware initialisation, then a RAM test over `0x200000–0x2FFFFF`.
+   The CPU actually runs the identical copy of this code in the boot block at `0x0`.
+2. CRC check of the data block at `0x4000` (unit data, see [Flash layout and checksums](#flash-layout-and-checksums))
+3. The monitor is copied from the boot block to RAM at `0x2FC000` and started
 4. The monitor waits **briefly** for a `*` (timeout loop of `0xFFFFF` iterations,
    estimated at about 1–2 s)
 5. If **no** `*` arrives and the self-test passed, the normal instrument
@@ -107,7 +110,8 @@ the instrument has to be switched off again before the next attempt.
 ```
 gt8650_dump.py -p PORT [-b BAUD] [--start ADDR] [--length N] [--base ADDR]
                [-o FILE] [--verify REF.bic] [--probe] [--wait SEC]
-               [--read-timeout SEC]
+               [--read-timeout SEC] [--restart] [--retries N]
+               [--max-recoveries N]
 ```
 
 | Option              | Meaning                                                                                  |
@@ -115,27 +119,49 @@ gt8650_dump.py -p PORT [-b BAUD] [--start ADDR] [--length N] [--base ADDR]
 | `-p`, `--port`      | Serial port (required)                                                                   |
 | `-b`, `--baud`      | Baud rate, default `9600`                                                                |
 | `--start`           | Start address (decimal or `0x…`), default = `--base`, i.e. `0x6000`                      |
-| `--length`          | Number of bytes. If omitted, reads up to the end of the `--verify` file                  |
+| `--length`          | Number of bytes. If omitted, reads up to the end of the firmware image: taken from the `--verify` file, otherwise from the length field in the device's boot header (`0x6414`) |
 | `--base`            | Bus address of byte 0 of the `.bic`, default `0x6000`. Only needed for other firmware versions |
 | `-o`, `--out`       | Output file, default `dump.bin`                                                          |
-| `--verify REF.bic`  | After reading, compares the part of the dump that overlaps the reference. With `--probe`: checks the mapping |
-| `--probe`           | Reads 16 bytes each at `0x0`, `0x4000` and `--base`, checks the mapping, then exits      |
+| `--verify REF.bic`  | After reading, compares the part of the dump that overlaps the reference (same firmware version only). With `--probe`: checks the mapping |
+| `--probe`           | Reads 16 bytes each at `0x0`, `0x4000` and `--base`, shows image length and checksum from the boot header, checks the data-block CRC, then exits |
 | `--wait`            | How long to keep sending `*` while waiting for power-on, default `60` s                  |
 | `--read-timeout`    | Timeout per `read()` in seconds, default `0.25`                                          |
+| `--restart`         | Overwrite an existing output file instead of resuming it                                 |
+| `--retries`         | `PEH` retries per block before recovery starts, default `4`                              |
+| `--max-recoveries`  | Recovery attempts per failure before giving up, default `6` (from #3 on: power-cycle prompt) |
 
-Exit code `2` means no banner and no active monitor was found.
+After every dump the script runs a **self-check**: it verifies the checksums of all
+regions the dump fully covers (boot block, data block, firmware image). No reference
+`.bic` is needed for that, so it works for any firmware version.
+
+If the link drops, the script resyncs, reopens the port and finally asks for a
+power-cycle. If it gives up or you press Ctrl-C, run the same command again: the
+existing output file is resumed.
+
+Exit codes: `1` = stopped (resumable), `2` = no banner and no active monitor found,
+`3` = a self-check failed.
 
 ### Examples
 
-Quick check of the link and the mapping:
+Quick check of the link, plus the image length and checksum of the installed firmware:
 
 ```bash
-python3 gt8650_dump.py -p /dev/tty.usbserial-XXXX --probe --verify 8600_155.bic
+python3 gt8650_dump.py -p /dev/tty.usbserial-XXXX --probe
 ```
 
-Expected: `[+] 0x6000 matches .bic byte 0 -> mapping CONFIRMED.`
+With `--verify 8600_155.bic` it also prints
+`[+] 0x6000 matches .bic byte 0 -> mapping CONFIRMED.` (if the unit runs 1.55).
 
-Read the firmware range and check it against the `.bic`:
+Read the installed firmware image, whatever its version (length from the device,
+self-checked):
+
+```bash
+python3 gt8650_dump.py -p /dev/tty.usbserial-XXXX -o firmware.bin
+```
+
+Expected at the end: `[+] self-check firmware image @0x006000: length 0x…, checksum 0x… OK`.
+
+Read the firmware range and also compare it with a `.bic` of the same version:
 
 ```bash
 python3 gt8650_dump.py -p /dev/tty.usbserial-XXXX -o firmware.bin --verify 8600_155.bic
@@ -144,16 +170,28 @@ python3 gt8650_dump.py -p /dev/tty.usbserial-XXXX -o firmware.bin --verify 8600_
 On success the output ends with
 `[+] VERIFY OK: 1080718 bytes at 0x006000..0x10dd8d match 8600_155.bic`.
 
-Read the whole flash (2 MB), i.e. boot block, data block at `0x4000` and firmware.
-`--verify` automatically checks the firmware part starting at `0x6000`:
+Read the whole flash (2 MB), i.e. boot block, data block at `0x4000`, firmware and
+NV data. The self-check covers all three checksummed regions:
 
 ```bash
-python3 gt8650_dump.py -p /dev/tty.usbserial-XXXX --start 0 --length 0x200000 -o flash_full.bin --verify 8600_155.bic
+python3 gt8650_dump.py -p /dev/tty.usbserial-XXXX --start 0 --length 0x200000 -o flash_full.bin
 ```
 
 For an EOL instrument the full dump is the valuable part: the boot block
-(`0x0000–0x3FFF`) and the data block (`0x4000–0x5FFF`, probably calibration data)
-are **not** contained in the `.bic`.
+(`0x0000–0x3FFF`), the data block (`0x4000–0x5FFF`, unit data) and the NV data at
+`0x1E0000` are **not** contained in the `.bic`.
+
+### Extracting a `.bic` from a dump
+
+`extract_bic.py` needs no extra packages. It checks every checksum and writes
+`flash[0x6000 : 0x6000 + len]`, which is byte-identical to a `.bic` of that version:
+
+```bash
+python3 extract_bic.py flash_full.bin -o 8600_158.bic
+```
+
+For a dump that does not start at `0` pass `--start` (e.g. `--start 0x6000`).
+Given a `.bic`, the script only checks its checksum.
 
 ### Duration
 
@@ -163,7 +201,7 @@ The script shows the remaining time (ETA) while dumping.
 
 | Range                 | Size        | Minimum duration |
 |-----------------------|-------------|------------------|
-| Firmware image        | 1,080,718 B | about 45 min     |
+| Firmware image (1.55) | 1,080,718 B | about 45 min     |
 | Full 2 MB flash       | 2,097,152 B | about 85 min     |
 
 ---
@@ -193,15 +231,36 @@ Derived from the chip-select table (file `0x301A`) and the initialisation code:
 | Range                       | Contents                                                  |
 |-----------------------------|-----------------------------------------------------------|
 | `0x000000–0x0FFFFF`         | Flash, CS0                                                |
-| ` ├ 0x000000–0x003FFF`      | Boot block (not in the `.bic`, contents unknown)          |
-| ` ├ 0x004000–0x005FFF`      | Data block with checksum (not in the `.bic`)              |
+| ` ├ 0x000000–0x003FFF`      | Boot block: copy of the boot/monitor code; the CPU resets into it (not in the `.bic`) |
+| ` ├ 0x004000–0x005FFF`      | Data block with CRC, unit data (not in the `.bic`)        |
 | ` └ 0x006000–…`             | Firmware image `8600_155.bic` (VBR = `0x6000`)            |
-| `0x100000–0x1FFFFF`         | Flash, CS1 (continued; the image ends at `0x10DD8D`)      |
+| `0x100000–0x1FFFFF`         | Flash, CS1 (continued; the 1.55 image ends at `0x10DD8D`) |
+| ` └ 0x1E0000–…`             | NV measurement/settings data (not in the `.bic`)          |
 | `0x200000–0x2FFFFF`         | RAM, CS2. The monitor runs from RAM at `0x2FC000`         |
 | `0x800000…`                 | Peripherals, CS3                                          |
 | `0xFFFFF000…`               | Internal 68340 registers (MBAR). The serial port is at `0xFFFFF700` |
 
 Conversion: **device address = offset in the `.bic` + `0x6000`**.
+
+## Flash layout and checksums
+
+Found in the 1.58 and 1.61 full dumps and verified for all three versions.
+`sum16` is the 32-bit sum (mod 2³²) of the big-endian 16-bit words.
+
+| Region | Format | Checksum |
+|--------|--------|----------|
+| Firmware image `0x6000` | Vector table, boot header at `0x6400`: length at `0x6414`, checksum at `0x6418` | `sum16(image[0 : len])` with the checksum field counted as 0 |
+| Boot block `0x0000` | Copy of image `0x400–0x2EAF` (0x2AB0 bytes so far), field `0x0C` = unit ID, then trailer: u32 `0x2AB4`, u32 checksum | `sum16(block[0 : 0x2AB4])` |
+| Data block `0x4000` | u32 length L (≤ `0x2000`, includes the length word), data, u32 CRC at `0x4000 + L` | CRC-16/XMODEM of the bytes in the high word, CRC-16/XMODEM of the bit-reversed bytes in the low word (routine at bus `0x875C`) |
+
+| | 1.55 (`.bic`) | 1.58 dump | 1.61 dump |
+|---|---|---|---|
+| Image length | `0x107D8E` | `0x108012` | `0x107DCE` |
+| Image checksum | `0xF30EEABF` | `0xF2095A84` | `0xF2C7306F` |
+| Unit ID (boot `0x0C`, data `0x4010`) | – | `0x0083FD8B` = 8650123 | `0x0083FD9D` = 8650141 |
+
+The two dumps carry different unit IDs, so they most likely come from two
+different instruments. Details are in the analysis report, section 6.
 
 ---
 
@@ -241,16 +300,15 @@ have been corrected in the current documents:
 
 ## Open points
 
-- The script has not yet been run on real hardware. It has only been tested against
-  a simulated device: power-on, boot window, already active monitor, and a full dump
-  byte-identical to the `.bic`.
+- The script has produced two full dumps on live units. The recovery and resume paths
+  were tested only against a simulated device.
 - The length of the `*` window is an estimate. That is why the script sends `*` continuously.
 - How the monitor responds to empty or unknown lines has not been analysed.
   The "monitor already active" check sends a CR and discards whatever comes back.
-- The checksum in the boot header (`0x6418`) and the one in the data block (`0x4000`)
-  have not been analysed: neither the algorithm nor the covered range is known.
-- The boot block at `0x0` is not in the `.bic`. That it loads the same monitor layout
-  is inferred from the entry-address calculation (`0x71C4 − 0x6400 + 0x2FC000`), not proven.
+- All three checksum algorithms are known, but only the data-block check has been
+  located in the code (`0x6BBE`). Where the image checksum and the boot-block trailer
+  are checked is still open.
+- The meaning of the data-block fields and of the unit ID is a guess.
 
 ## Reference firmware
 
@@ -261,13 +319,25 @@ have been corrected in the current documents:
 | CRC32       | `7414aad0` |
 | SHA-256     | `6fe062387758c7e7c2f4313963a99a860be889aed99918fdb81e397de44f26cf` |
 | Format      | Raw image of the flash range `0x6000–0x10DD8D`, no file header or trailer |
-| Internal checksum | Field at `0x6418` in the boot header; algorithm and covered range not analysed |
+| Internal checksum | `0xF30EEABF` at `0x6418` in the boot header: `sum16` over the image with the field counted as 0 |
 | CPU         | Motorola MC68340 (CPU32), big-endian |
 | RTOS        | Nucleus PLUS – 68340D Version 1.11.4 |
 | Identification | `(C) Giga-tronics, 1999`, `Gigatronics 8650 Universal Power Meter` |
 
 CRC32 and SHA-256 are taken over the whole file. They only identify the file; the
 firmware does not check them.
+
+Two more versions were extracted from full dumps of live units with `extract_bic.py`.
+These files contain only the firmware image, no unit-specific data (the unit ID is
+in the boot block and the data block), so the same version should give the same hash
+on every unit. The full-flash dumps themselves are not listed: they also contain the
+unit ID and NV data and are therefore unique to each instrument.
+
+| File | Size | Image checksum | CRC32 | SHA-256 |
+|------|------|----------------|-------|---------|
+| `8600_155.bic` | 1,080,718 B (`0x107D8E`) | `0xF30EEABF` | `7414aad0` | `6fe062387758c7e7c2f4313963a99a860be889aed99918fdb81e397de44f26cf` |
+| `8600_158.bic` | 1,081,362 B (`0x108012`) | `0xF2095A84` | `0e8391e8` | `710b25387d8f3d6c9fb0f31984bfc7dd33d10fcf837889e063e5887f1e63c311` |
+| `8600_161.bic` | 1,080,782 B (`0x107DCE`) | `0xF2C7306F` | `bd154108` | `a3ff8a682fee2b0b458a4ebf3c07edb1662087f649c959382265138a6cc06f09` |
 
 The `.bic` is a byte-for-byte copy of the flash contents from `0x6000` onwards:
 
@@ -279,9 +349,8 @@ The `.bic` is a byte-for-byte copy of the flash contents from `0x6000` onwards:
   (jump table, length, checksum). It is not a container header of the file.
 
 The `.bic` only covers part of the flash. The boot block (`0x0000–0x3FFF`), the data
-block (`0x4000–0x5FFF`) and everything after `0x10DD8D` are missing. That the bytes sit
-in the instrument exactly like this is derived from the code. It still has to be
-confirmed on real hardware with `--probe`.
+block (`0x4000–0x5FFF`) and everything after `0x10DD8D` are missing. The 1.58 and
+1.61 dumps from live units have exactly this layout at `0x6000`.
 
 ## Key locations in the firmware
 
