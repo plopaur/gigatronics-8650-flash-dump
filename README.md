@@ -20,7 +20,7 @@ A fourth image, `8650_135.bic` (an older 8650 build), also passes the image chec
 |------|----------|
 | `gt8650_dump.py` | The dump tool |
 | `extract_bic.py` | Checks a dump offline and cuts out the firmware image as `.bic` (also provides the checksum code for the dump tool) |
-| `GT8650_Firmware_Analysis.md` | Firmware analysis report (revised 14 Oct 2026) |
+| `GT8650_Firmware_Analysis.md` | Firmware analysis report (revised 16 Oct 2026) |
 | `GT8650_HyperTerminal_Read100.md` | Guide: reading the first 100 bytes by hand (revised 13 Oct 2026) |
 | `md2pdf.py` | Generates PDFs from the `.md` files (ReportLab) |
 | `LICENSE` | MIT license |
@@ -132,7 +132,8 @@ gt8650_dump.py -p PORT [-b BAUD] [--start ADDR] [--length N] [--base ADDR]
 | `--max-recoveries`  | Recovery attempts per failure before giving up, default `6` (from #3 on: power-cycle prompt) |
 
 After every dump the script runs a **self-check**: it verifies the checksums of all
-regions the dump fully covers (boot block, data block, firmware image). No reference
+regions the dump fully covers (boot block, data block, firmware image, NV journal) and
+reports any data between the image and `0x1E0000`. No reference
 `.bic` is needed for that, so it works for any firmware version.
 
 If the link drops, the script resyncs, reopens the port and finally asks for a
@@ -172,15 +173,15 @@ On success the output ends with
 `[+] VERIFY OK: 1080718 bytes at 0x006000..0x10dd8d match 8600_155.bic`.
 
 Read the whole flash (2 MB), i.e. boot block, data block at `0x4000`, firmware and
-NV data. The self-check covers all three checksummed regions:
+NV journal. The self-check covers all four checksummed regions:
 
 ```bash
 python3 gt8650_dump.py -p /dev/tty.usbserial-XXXX --start 0 --length 0x200000 -o flash_full.bin
 ```
 
 For an EOL instrument the full dump is the valuable part: the boot block
-(`0x0000–0x3FFF`), the data block (`0x4000–0x5FFF`, unit data) and the NV data at
-`0x1E0000` are **not** contained in the `.bic`.
+(`0x0000–0x3FFF`), the data block (`0x4000–0x5FFF`, unit data) and the NV journal at
+`0x1E0000` (saved setups) are **not** contained in the `.bic`.
 
 ### Extracting a `.bic` from a dump
 
@@ -201,6 +202,14 @@ python3 extract_bic.py 8650_135.bic -o 8650_135_trimmed.bic
 ```
 
 `gt8650_dump.py --verify` also ignores this padding.
+
+For a full dump, `--nv` also lists the records of the NV journal (see
+[Flash layout and checksums](#flash-layout-and-checksums)). Identical repeats are
+shown on one line, and the newest record of each type is marked as current:
+
+```bash
+python3 extract_bic.py flash_full.bin --nv
+```
 
 ### Duration
 
@@ -244,7 +253,7 @@ Derived from the chip-select table (file `0x301A`) and the initialisation code:
 | ` ├ 0x004000–0x005FFF`      | Data block with CRC, unit data (not in the `.bic`)        |
 | ` └ 0x006000–…`             | Firmware image `8600_155.bic` (VBR = `0x6000`)            |
 | `0x100000–0x1FFFFF`         | Flash, CS1 (continued; the 1.55 image ends at `0x10DD8D`) |
-| ` └ 0x1E0000–…`             | NV measurement/settings data (not in the `.bic`)          |
+| ` └ 0x1E0000–0x1EFFFF`      | NV journal with the saved setups (not in the `.bic`)      |
 | `0x200000–0x2FFFFF`         | RAM, CS2. The monitor runs from RAM at `0x2FC000`         |
 | `0x800000…`                 | Peripherals, CS3                                          |
 | `0xFFFFF000…`               | Internal 68340 registers (MBAR). The serial port is at `0xFFFFF700` |
@@ -262,6 +271,7 @@ versions, including the 1.35 `.bic`.
 | Firmware image `0x6000` | Vector table, boot header at `0x6400`: length at `0x6414`, checksum at `0x6418` | `sum16(image[0 : len])` with the checksum field counted as 0 |
 | Boot block `0x0000` | Copy of image `0x400–0x2EAF` (0x2AB0 bytes so far), field `0x0C` = unit ID, then trailer: u32 `0x2AB4`, u32 checksum | `sum16(block[0 : 0x2AB4])` |
 | Data block `0x4000` | u32 length L (≤ `0x2000`, includes the length word), data, u32 CRC at `0x4000 + L` | CRC-16/XMODEM of the bytes in the high word, CRC-16/XMODEM of the bit-reversed bytes in the low word (routine at bus `0x875C`) |
+| NV journal `0x1E0000` | u32 state (`FFFFFFFE` = in use), then appended records: u16 len, u8 type, u8 0, payload (starts `A5A5`), u16 checksum; ends at a length of `FFFF` | 16-bit sum of the payload bytes after `A5A5` |
 
 | | 1.35 (`.bic`) | 1.55 (`.bic`) | 1.58 dump | 1.61 dump |
 |---|---|---|---|---|
@@ -271,6 +281,18 @@ versions, including the 1.35 `.bic`.
 
 The two dumps carry different unit IDs, so they most likely come from two
 different instruments. Details are in the analysis report, section 6.
+
+The NV journal holds saved setups: 16 records in the 1.58 dump (types 3 and 6),
+30 in the 1.61 dump (types 2, 3, 5, 6). The meaning of most fields is unknown.
+It contains no sensor calibration data, no serial number as text and no
+operating-hours counter.
+
+Between the image and `0x1E0000` the flash normally holds only zero padding and
+erased bytes. The 1.61 dump is an exception: `0x10E000–0x1163FF` still holds the
+tail of an earlier, longer firmware. The updater apparently erases only the
+sectors the new image needs. The checksum does not cover that area, and the
+instrument does not use it; `extract_bic.py` reports it only for information.
+Details are in the analysis report, sections 6.6 and 6.7.
 
 ---
 
@@ -319,6 +341,7 @@ have been corrected in the current documents:
   located in the code (`0x6BBE`). Where the image checksum and the boot-block trailer
   are checked is still open.
 - The meaning of the data-block fields and of the unit ID is a guess.
+- The NV journal format is verified, but the meaning of its record types and fields is not.
 
 ## Reference firmware
 

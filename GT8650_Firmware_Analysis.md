@@ -2,7 +2,9 @@
 # Firmware Analysis: Serial Flash Read-out
 
 Giga-tronics 8650 Universal Power Meter (8600A series)
-Image: `8600_155.bic` - static reverse-engineering report - 9 Oct 2026, revised 13 and 14 Oct 2026
+Image: `8600_155.bic` - static reverse-engineering report - 9 Oct 2026, revised 13, 14 and 16 Oct 2026
+
+> **Revision 16 Oct 2026.** The rest of the two full dumps was decoded. The NV data at 0x1E0000 is an append-only record journal with a per-record checksum (section 6.7). The 1.61 dump also holds about 33 KB left over from an earlier, longer firmware after its image (section 6.6). The firmware contains two flash sector tables (section 6.6). `extract_bic.py` checks both regions and lists the journal with `--nv`. All changes are listed in section 9.
 
 > **Revision 14 Oct 2026.** Two full 2 MB flash dumps read from live units (firmware 1.58 and 1.61) were compared with the .bic. They confirm that a .bic is a raw slice of flash with no container header. All three checksums (firmware image, boot block, data block) are now decoded, and the boot block at 0x0 turns out to be a copy of the image's boot code. New section 6; all changes are listed in section 9. A fourth image, `8650_135.bic` (an older 8650 build, zero-padded), was compared as well; its image checksum matches (section 6.5).
 
@@ -92,7 +94,7 @@ Consequence for dumping: the bytes of this image appear on the bus at **0x000060
 | 0x004000-0x005FFF | Data block with length + CRC, checked at boot (unit data; not part of the .bic; section 6.4) |
 | 0x006000-0x0063FF | Exception vector table (VBR = 0x6000) |
 | 0x006400-0x10DD8D | Boot header from 0x6400 (layout as for 1.55; the end address depends on the version) (SP, jump to boot entry (0x6408), image length 0x107D8E (0x6414), checksum (0x6418), application entry (0x641C), monitor entry (0x6420)), followed by application code and data |
-| 0x1E0000-0x1E0FFF | Non-volatile measurement/settings data (seen in the dumps; differs between units) |
+| 0x1E0000-0x1EFFFF | NV journal: setup records, appended on every save (section 6.7; differs between units) |
 | 0x200000-0x2FFFFF | RAM; the monitor runs from a copy at 0x2FC000 |
 | 0x800000- | Peripherals (CS3) |
 | 0xFFFFF000- | MC68340 on-chip modules (MBAR) |
@@ -110,8 +112,9 @@ Two complete dumps (`--start 0 --length 0x200000`) were read from live units wit
 | 0x000000-0x002AB7 | Boot block (0x2AB0 bytes of code + 8-byte trailer), rest up to 0x3FFF erased (FF) |
 | 0x004000-0x004017 | Data block (length 0x14 + CRC), rest up to 0x5FFF erased |
 | 0x006000-0x10E011 | Firmware image 1.58 (0x108012 bytes); 1.61 ends at 0x10DDCD (0x107DCE bytes) |
-| up to 0x10EFFF | 00 padding, then erased up to 0x1DFFFF |
-| 0x1E0000-0x1E0783 | NV measurement/settings data (starts `FFFFFFFE 00AE0300 A5A5 ...`) |
+| 0x10E012-0x10E3FF | 00 padding to a 1 KiB boundary (1.58), then erased up to 0x1DFFFF |
+| 0x10E000-0x1163FF | 1.61 only: tail of an earlier, longer firmware (section 6.6) |
+| 0x1E0000-0x1E0783 | NV journal, 16 records (1.61: up to 0x1E1DA3, 30 records; section 6.7) |
 | rest | erased |
 
 ### 6.2 Firmware image = .bic
@@ -173,6 +176,43 @@ A further image, `8650_135.bic`, was found as a file (not read from a unit). The
 - **Boot code** 0x430-0x2EAF differs from 1.55. Because the boot block at flash 0x0 is a copy of this range (section 6.3), installing 1.35 on a unit would also need a matching boot block. The CRC tables at 0x2A48-0x2D47 are identical.
 - **Similarity:** only 47 % (1.55, 1.58) and 44 % (1.61) of its 16-byte blocks occur verbatim in the 8600 images.
 
+### 6.6 Data after the image, and the flash sector tables
+
+In the 1.58 dump the image is followed only by zero padding up to 0x10E3FF, then erased flash. In the 1.61 dump the image ends at 0x10DDCD with zero padding as well, but 0x10E000-0x1163FF is not erased: it holds about 33 KB of firmware data (9,023 bytes other than 00 or FF).
+
+- **Content:** the end of a firmware image. It holds menu strings ("Recall Setup", "Strip Chart Config", "Gate/Trigger", "REMOTE MESSAGE" and others), the two-digit number tables used for display formatting, and UI structures that point into RAM (0x2178xx).
+- **Origin:** 32-byte blocks of it occur in all four known images, most often in `8650_135.bic`, at a constant offset of 0x1400 (147 blocks; for the 8600 images it is at most 102 blocks). It is therefore not the tail of 1.35, 1.55, 1.58 or 1.61. It most likely comes from an 8650 build about 5 KiB longer than 1.35, whose padded image ended at 0x1163FF (length about 0x110400).
+- **Sector tables:** the image contains two flash sector tables at file 0x2930 and 0x29EC (identical in 1.55-1.61). The first lists 8 KiB sectors from 0x0 to 0x10000 and from 0x100000 to 0x110000, and 64 KiB sectors otherwise. The second lists 16 + 8 + 8 + 96 KiB and then 128 KiB sectors. That is the layout of an Intel-style bottom-boot chip; the boot block (16 KiB at 0x0) and the data block (8 KiB at 0x4000) fit it. The firmware therefore seems to support two flash types.
+- **Interpretation (not proven):** the leftover starts exactly on the 8 KiB boundary 0x10E000 after the sector that holds the end of 1.61. This fits a unit with the first chip type, whose updater erases only the sectors the new image needs. The sectors after them keep whatever an earlier, longer image left there.
+
+The image checksum does not cover this region, and the instrument does not use it. `extract_bic.py` reports it (only for information) when a dump covers 0x6000 to 0x1E0000.
+
+### 6.7 NV journal at 0x1E0000
+
+The NV data is an append-only journal in the 64 KiB sector 0x1E0000-0x1EFFFF. The next sector, 0x1F0000, is erased in both dumps.
+
+```
+u32  state                 FFFFFFFF = erased, FFFFFFFE = in use
+then records, until a length of FFFF:
+u16  len                   payload length
+u8   type
+u8   0
+     payload[len]          always starts with A5 A5
+u16  sum                   16-bit sum of the payload bytes after A5 A5
+```
+
+The checksum matches all 46 records in both dumps. A save appends one record per changed or saved block; earlier records are not overwritten. Presumably the newest record of each type is the current one, and the sector is erased and rewritten when it is full (the compaction code has not been located).
+
+| Dump | Records | Types |
+|---|---|---|
+| 1.58 (unit 8650123) | 16 = 8 saves of (3, 6) | All copies identical |
+| 1.61 (unit 8650141) | 30 | 2, 5, 3, 6; type 6 changes once (at 0x1E09A8) |
+
+- **Types 2 and 5** (0x1BE bytes, identical to each other; only in the 1.61 dump): an instrument setup. It holds integers such as 10000 (0x2710), 2000 (0x07D0) and 90 (0x5A), and IEEE floats such as 20.0, -80.0, -60.0, -77.0, 23.0, 10.0, 1.0 and 0.01. These look like averaging, limit, analog-output and strip-chart settings. Type 2 and 5 may be the current and the power-on setup, or sensor A and B (not proven). No stored setup names are present.
+- **Types 3 and 6** (0xAE and 0x36 bytes): repeated sub-structures that consist mostly of values in the RAM range: 0x23D934, 0x23CE9C, 0x23DE14, 0x2DD424, 0x2DD42C. The first three appear as constants in the 1.58 and 1.61 code, so these are RAM structures saved byte for byte, with pointers in them, rather than settings with a meaning outside the running firmware.
+
+The journal holds no sensor calibration data (the sensors carry their own), no serial number as text and no operating-hours counter. The only unit identity in flash is the ID in the boot block and the data block.
+
 ## 7. Entering the monitor
 
 The boot path (addresses from 0x6000 upward lie in the image; subtract 0x6000 for the file offset). After a reset the CPU runs the identical copy in the boot block (section 6.3), where every address below is 0x6400 lower:
@@ -193,11 +233,11 @@ A self-contained Python 3 tool (pyserial) that drives the monitor and reassemble
 - Reads in 40-byte blocks via `PEH0<addr>`, parses the hex reply, retries on short or garbled lines, and shows progress with an ETA.
 - Supports arbitrary `--start` / `--length`. The default start is 0x6000, and `--base` overrides the mapping. Without `--length` (and without `--verify`) the image length is read from the device's boot header at 0x6414, so the installed firmware is dumped exactly, whatever its version.
 - Every block is flushed to disk; on link errors it resyncs, reopens the port or asks for a power-cycle, and a re-run resumes an interrupted dump.
-- **Self-check:** after the dump it verifies the checksums of every region the dump fully covers (boot block, data block, firmware image). No reference file is needed; a failed check ends with exit code 3.
+- **Self-check:** after the dump it verifies the checksums of every region the dump fully covers (boot block, data block, firmware image, NV journal) and reports data after the image. No reference file is needed; a failed check ends with exit code 3.
 - `--verify` compares the part of the dump that overlaps a reference .bic placed at the base address. This only makes sense for the same firmware version.
 - `--probe` reads 0x0, 0x4000 and 0x6000, shows the image length and checksum from the boot header, checks the data-block CRC, and confirms the mapping against the reference if one is given.
 
-`extract_bic.py` (no dependencies; imported by the dumper for the checksum code) checks a dump offline and writes the firmware image as a .bic. Given a .bic it only checks the image checksum; a .bic with less than 4 KiB of zero padding after the image (such as `8650_135.bic`) is also recognised, and `-o` writes it without the padding.
+`extract_bic.py` (no dependencies; imported by the dumper for the checksum code) checks a dump offline and writes the firmware image as a .bic. For a full dump it also reports data after the image (section 6.6) and checks the NV journal record checksums (section 6.7); `--nv` lists the journal records. Given a .bic it only checks the image checksum; a .bic with less than 4 KiB of zero padding after the image (such as `8650_135.bic`) is also recognised, and `-o` writes it without the padding.
 
 ### Typical use:
 
@@ -217,6 +257,15 @@ python3 extract_bic.py flash_full.bin -o 8600_158.bic
 At 9600 baud one 40-byte block costs about 92 characters on the wire, so throughput is at most about 400 B/s. Even at that rate the image takes about 45 min and the full 2 MB flash about 85 min.
 
 ## 9. Changes
+
+### Revision 16 Oct 2026
+
+| Before | Now |
+|---|---|
+| NV data at 0x1E0000: "measurement/settings data", format unknown | Append-only journal: state word, records with length, type, A5A5 magic and a 16-bit byte sum (section 6.7) |
+| 1.58: 00 padding up to 0x10EFFF | 00 padding up to 0x10E3FF (1 KiB boundary), then erased |
+| Flash after the image: padding and erased | 1.61 dump: tail of an earlier, longer firmware at 0x10E000-0x1163FF; two flash sector tables in the image (section 6.6) |
+| `extract_bic.py` checks boot block, data block and image | Also checks the NV journal, reports data after the image, `--nv` lists the journal |
 
 ### Revision 14 Oct 2026
 
@@ -246,4 +295,6 @@ At 9600 baud one 40-byte block costs about 92 characters on the wire, so through
 - **Power-on window.** The 1-2 s figure is an estimate from the poll loop; the dumper therefore sends `*` continuously.
 - **Checksum consumers.** The algorithms of all three checksums are known and verified. Only the data-block CRC check has been located in the code (0x6BBE); where the image checksum and the boot-block trailer are checked (probably by the application or the upload procedure) is still open.
 - **Data block meaning.** The interpretation of the data-block fields and of the unit ID is a guess.
+- **NV journal.** The record format and checksum are verified; the meaning of the record types and of most fields is not. The code that writes, reads and compacts the journal has not been located.
+- **Flash type.** Which of the two sector tables applies to which unit, and that the updater erases only the sectors it needs, is inferred from the 1.61 leftover, not from the code.
 - **Baud clock.** 9600 baud assumes the standard 3.6864 MHz serial clock; if no banner appears, try 19200 and 115200.

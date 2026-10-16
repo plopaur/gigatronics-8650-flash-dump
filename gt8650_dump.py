@@ -45,8 +45,8 @@ USAGE EXAMPLES
 
 SELF-CHECK
   After every dump the checksums of all regions the dump fully covers are
-  checked (boot block, data block, firmware image), so no reference .bic is
-  needed.  extract_bic.py cuts the firmware image out of a full dump.
+  checked (boot block, data block, firmware image, NV journal), and data
+  after the image is reported, so no reference .bic is needed.  extract_bic.py cuts the firmware image out of a full dump.
 
 RESUME / RECOVERY
   Every block is flushed to disk.  If the monitor stops answering, the script

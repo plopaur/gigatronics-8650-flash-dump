@@ -19,7 +19,17 @@ Flash layout and checksums (verified on 1.55 .bic, 1.58 and 1.61 dumps):
             (len @0x6414, checksum @0x6418).  Checksum = sum16(image[0 : len])
             with the checksum field counted as 0.
 
+  0x1E0000  NV journal (64 KiB sector): u32 state (FFFFFFFE = in use), then
+            append-only records  u16 len, u8 type, u8 0, payload[len]
+            (starting A5A5), u16 sum of the payload bytes after A5A5.
+            A save appends records; the newest record of a type is current.
+
   sum16 = 32-bit sum of the big-endian 16-bit words, modulo 2**32.
+
+  Between the image end and 0x1E0000 the flash should be zero padding and
+  erased bytes.  Other data there is reported: the updater does not erase
+  sectors beyond the new image, so a longer earlier firmware leaves its tail
+  behind (seen in the 1.61 dump at 0x10E000-0x1163FF).
 
 USAGE
   # check a full dump (read with --start 0) and write the image as .bic
@@ -34,6 +44,9 @@ USAGE
 
   # strip the padding from a padded .bic
   python3 extract_bic.py 8650_135.bic -o 8650_135_trimmed.bic
+
+  # list every record of the NV journal of a full dump
+  python3 extract_bic.py full_firmware_1_61.bin --nv
 """
 import os, sys, struct, argparse
 
@@ -48,6 +61,9 @@ DATA_BASE   = 0x004000
 DATA_MAX    = 0x2000
 PAD_MAX     = 0x1000      # zero padding tolerated after the image in a .bic
 ID_OFF      = 0x0C        # boot-block field patched with the unit ID
+NV_BASE     = 0x1E0000    # NV journal sector
+NV_SIZE     = 0x10000
+NV_MAGIC    = b'\xa5\xa5'  # first two payload bytes of every NV record
 
 u32 = lambda b, o: struct.unpack_from('>I', b, o)[0]
 
@@ -131,6 +147,46 @@ def check_data(blk):
                 f"{'OK' if ok else f'MISMATCH (computed {calc:#010x})'}, "
                 f"data {blk[4:length].hex(' ')}")
 
+def parse_nv(blk):
+    """blk = flash 0x1E0000-0x1EFFFF.  Returns (state, records, end, error);
+    records are (offset, type, payload, stored_sum, computed_sum)."""
+    state, recs, p = u32(blk, 0), [], 4
+    while p + 2 <= len(blk) and blk[p:p + 2] != b'\xff\xff':
+        length, typ = struct.unpack_from('>HB', blk, p)
+        if p + 6 + length > len(blk):
+            return state, recs, p, f"record at +{p:#x} runs past the sector"
+        payload = blk[p + 4:p + 4 + length]
+        stored = struct.unpack_from('>H', blk, p + 4 + length)[0]
+        calc = sum(payload[len(NV_MAGIC):]) & 0xFFFF
+        recs.append((p, typ, payload, stored, calc))
+        p += length + 6
+    return state, recs, p, None
+
+def check_nv(blk):
+    """blk = flash 0x1E0000-0x1EFFFF.  Returns (ok, msg)."""
+    state, recs, end, err = parse_nv(blk)
+    if state == 0xFFFFFFFF and not recs:
+        return True, "erased"
+    bad = [r for r in recs if r[3] != r[4] or r[2][:2] != NV_MAGIC]
+    types = sorted({r[1] for r in recs})
+    msg = (f"state {state:#010x}, {len(recs)} records (types "
+           f"{', '.join(map(str, types))}), used up to +{end:#x}")
+    if bad:
+        msg += f", {len(bad)} with bad magic or checksum (first at +{bad[0][0]:#x})"
+    if err:
+        msg += f", {err}"
+    return not bad and not err, msg
+
+def check_residue(gap, gap_start):
+    """gap = flash from the image end up to NV_BASE.  Expected: zero padding,
+    then erased.  Returns (True, msg); other data is only reported."""
+    used = [i for i, x in enumerate(gap) if x not in (0x00, 0xFF)]
+    if not used:
+        return True, "zero padding and erased bytes only"
+    a, b = gap_start + used[0], gap_start + used[-1]
+    return True, (f"{len(used)} data bytes at {a:#08x}..{b:#08x} after the "
+                  f"image (probably left over from an earlier, longer firmware)")
+
 def check_flash(data, start=0, image_base=IMAGE_BASE):
     """Run every check whose region lies inside data (bus address start).
     Returns a list of (name, ok, msg)."""
@@ -144,9 +200,35 @@ def check_flash(data, start=0, image_base=IMAGE_BASE):
     if start <= DATA_BASE and end >= DATA_BASE + DATA_MAX:
         res.append(("data block @0x004000", *check_data(region(DATA_BASE, DATA_MAX))))
     if img is not None:
-        ok, _, msg = check_image(img)
+        ok, length, msg = check_image(img)
         res.append((f"firmware image @{image_base:#08x}", ok, msg))
+        gap = image_base + length
+        if ok and gap < NV_BASE <= end:
+            res.append((f"after image @{gap:#08x}",
+                        *check_residue(region(gap, NV_BASE - gap), gap)))
+    if start <= NV_BASE and end >= NV_BASE + NV_SIZE:
+        res.append((f"NV journal @{NV_BASE:#08x}", *check_nv(region(NV_BASE, NV_SIZE))))
     return res
+
+def print_nv(blk):
+    """List the NV journal records; the newest record of each type is current."""
+    state, recs, end, err = parse_nv(blk)
+    newest = {r[1]: r[0] for r in recs}
+    print(f"[*] NV journal @{NV_BASE:#08x}: state {state:#010x}, "
+          f"{len(recs)} records, used up to {NV_BASE + end:#08x}")
+    prev = {}
+    for p, typ, payload, stored, calc in recs:
+        flags = ('' if stored == calc else f'  CHECKSUM MISMATCH (computed {calc:#06x})')
+        flags += '  same as previous' if prev.get(typ) == payload else ''
+        flags += '  <- current' if newest[typ] == p else ''
+        print(f"  {NV_BASE + p:#08x}  type {typ}  len {len(payload):#05x}  "
+              f"sum {stored:#06x}{flags}")
+        if prev.get(typ) != payload:
+            for i in range(0, len(payload), 32):
+                print(f"      +{i:03x}  {payload[i:i + 32].hex(' ', 2)}")
+        prev[typ] = payload
+    if err:
+        print(f"[!] {err}")
 
 def main():
     ap = argparse.ArgumentParser(description="Check a GT8650 flash dump and "
@@ -157,6 +239,8 @@ def main():
                          "a .bic is detected automatically)")
     ap.add_argument('-o', '--out', help="write the image here "
                     "(default: <dump>.bic; not written for a .bic input)")
+    ap.add_argument('--nv', action='store_true', help="list the records of "
+                    "the NV journal at 0x1E0000 (full dumps only)")
     args = ap.parse_args()
     data = open(args.dump, 'rb').read()
 
@@ -177,7 +261,12 @@ def main():
                  f"the image start {IMAGE_BASE:#x}")
     for name, ok, msg in results:
         print(f"[{'+' if ok else '!'}] {name}: {msg}")
-    img_ok = results[-1][1]
+    img_ok = next(ok for n, ok, _ in results if n.startswith('firmware'))
+    if args.nv:
+        if not start <= NV_BASE <= NV_BASE + NV_SIZE <= start + len(data):
+            sys.exit(f"[!] dump does not cover the NV journal "
+                     f"{NV_BASE:#x}..{NV_BASE + NV_SIZE - 1:#x}")
+        print_nv(data[NV_BASE - start:NV_BASE - start + NV_SIZE])
 
     if is_bic and not args.out:
         return 0 if img_ok else 1
